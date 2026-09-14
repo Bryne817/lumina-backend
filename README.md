@@ -75,6 +75,32 @@ on testnet at `CAYUDQPV3RKPM3EXDFGI3457FV677JLUCJ4OLKWGCUBPRIHYKXK3WFAZ` with
 one demo entry (itself), used to verify the discovery wiring below end-to-end
 against a live contract.
 
+### Custom event schemas
+
+A project can register a schema describing how its contract's events decode into
+named, typed fields — "subgraph-style" indexing on top of the generic
+`contract_events` table — and query them through `customEvents` with typed
+filters:
+
+```graphql
+customEvents(
+  contractId: "C…"
+  event: "transfer"
+  where: [{ field: "amount", op: GT, value: "1000" }]
+) { items { fields { name type value } } }
+```
+
+Registration is a CLI operation against the database, so a schema can be
+iterated on without a transaction, and the Registry keeps deciding *which*
+contracts are indexed rather than *how* they decode:
+
+```bash
+npm run register-schema -w @lumina/indexer -- apply transfer-schema.json
+```
+
+See [docs/CUSTOM_SCHEMAS.md](docs/CUSTOM_SCHEMAS.md) for the format, a worked
+example, and what happens when a schema stops matching its contract.
+
 ## Run with Docker
 
 ```bash
