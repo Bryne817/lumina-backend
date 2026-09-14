@@ -20,10 +20,19 @@
  */
 
 import { Networks } from '@stellar/stellar-sdk';
-import { createPool, getLatestIndexedEventLedger, getLatestIndexedLedger, indexLedger, insertContractEvents } from './db';
+import {
+  createPool,
+  getLatestIndexedEventLedger,
+  getLatestIndexedLedger,
+  indexLedger,
+  insertContractEvents,
+  insertCustomEvents,
+  loadContractSchemas,
+} from './db';
+import { decodeEvents } from './customDecode';
 import { getAccount, getLatestLedgerSequence, getLedger, getLedgerOperations, getLedgerTransactions, HorizonAccount } from './horizon';
 import { getActiveContracts } from './registry';
-import { getEvents, getLatestLedgerSequence as getLatestRpcLedgerSequence } from './soroban';
+import { getEvents, getLatestLedgerSequence as getLatestRpcLedgerSequence, type ContractEvent } from './soroban';
 
 const HORIZON_URL = process.env.HORIZON_URL ?? 'https://horizon.stellar.org';
 const DATABASE_URL = process.env.DATABASE_URL ?? 'postgresql://localhost:5432/lumina';
@@ -183,10 +192,47 @@ async function pollContractEvents(): Promise<void> {
     if (events.length > 0) {
       console.log(`Indexing ${events.length} contract event(s) from ledger ${eventsCursor}...`);
       await insertContractEvents(pool, events);
+      await indexCustomEvents(events);
     }
     eventsCursor = Math.max(eventsCursor, latestLedger - EVENTS_SAFETY_LAG_LEDGERS + 1);
   } catch (err) {
     console.error('Contract event polling error:', err);
+  }
+}
+
+/**
+ * Decode this batch against any registered per-contract schemas.
+ *
+ * Deliberately after the generic insert and in its own try/catch: custom
+ * decoding is an addition on top of `contract_events`, so a broken schema — or
+ * a `custom_events` table that has not been migrated yet — must never cost the
+ * generic indexing that everything else depends on.
+ *
+ * Schemas are re-read each cycle rather than cached at startup, because
+ * registration is a CLI write to the database and there is no signal the
+ * indexer could receive.
+ */
+async function indexCustomEvents(events: ContractEvent[]): Promise<void> {
+  try {
+    const schemas = await loadContractSchemas(pool);
+    if (schemas.size === 0) return;
+
+    const { decoded, failures } = decodeEvents(schemas, events);
+
+    for (const failure of failures) {
+      // A matched event that will not decode means the schema and the contract
+      // have diverged — loud, because it is silently wrong data otherwise.
+      console.warn(
+        `Custom schema decode failed for event ${failure.eventId} (${failure.eventName}): ${failure.reason}`
+      );
+    }
+
+    if (decoded.length > 0) {
+      console.log(`Decoded ${decoded.length} event(s) against custom schemas.`);
+      await insertCustomEvents(pool, decoded);
+    }
+  } catch (err) {
+    console.error('Custom schema indexing error (generic indexing unaffected):', err);
   }
 }
 
