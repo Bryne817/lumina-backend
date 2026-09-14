@@ -14,6 +14,7 @@ import {
 } from './db';
 import { getAccount as getAccountFromHorizon, getLatestLedger as getLatestLedgerFromHorizon } from './horizon';
 import { createSubscriptionResolvers } from './subscriptions';
+import { getContractSchema, getCustomEvents, type CustomEventFilter } from './customEvents';
 import type { LedgerNotifier } from './pubsub';
 
 export interface Context {
@@ -123,6 +124,40 @@ export const resolvers = {
 
     async ledger(_: unknown, args: { sequence: number }, { pool }: Context) {
       return getLedgerBySequence(pool, args.sequence);
+    },
+
+    async customEvents(
+      _: unknown,
+      args: { contractId: string; event: string; where?: CustomEventFilter[] | null; limit?: number; cursor?: string },
+      { pool }: Context
+    ) {
+      const limit = args.limit ?? 20;
+      const items = await getCustomEvents(pool, {
+        contractId: args.contractId,
+        event: args.event,
+        where: args.where,
+        limit,
+        cursor: args.cursor,
+      });
+      return {
+        items,
+        pageInfo: {
+          hasNextPage: items.length === limit,
+          cursor: items.at(-1)?.eventId ?? null,
+        },
+      };
+    },
+
+    async contractSchema(_: unknown, args: { contractId: string }, { pool }: Context) {
+      const schema = await getContractSchema(pool, args.contractId);
+      if (!schema) return null;
+      return {
+        ...schema,
+        events: schema.events.map(event => ({
+          ...event,
+          fields: event.fields.map(field => ({ ...field, optional: field.optional ?? false })),
+        })),
+      };
     },
   },
 
