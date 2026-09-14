@@ -2,6 +2,8 @@ import { Pool, PoolClient } from 'pg';
 import type { HorizonAccount, HorizonLedger, HorizonOperation, HorizonTransaction } from './horizon';
 import type { ContractEvent } from './soroban';
 import { notifyIndexed } from './notify';
+import { parseContractSchema, type ContractSchema } from './customSchema';
+import type { DecodedCustomEvent } from './customDecode';
 
 export function createPool(databaseUrl: string): Pool {
   return new Pool({ connectionString: databaseUrl });
@@ -158,4 +160,86 @@ export async function insertContractEvents(pool: Pool, events: ContractEvent[]):
 export async function getLatestIndexedEventLedger(pool: Pool): Promise<number> {
   const { rows } = await pool.query<{ max: string | null }>('SELECT MAX(ledger) AS max FROM contract_events');
   return rows[0].max ? Number(rows[0].max) : 0;
+}
+
+// ─── Custom per-contract event schemas ─────────────────────────────────────
+
+/**
+ * Every registered schema, keyed by contract ID.
+ *
+ * Read once per poll cycle rather than cached indefinitely, so a schema
+ * registered while the indexer is running takes effect without a restart —
+ * registration is a CLI operation against the database, not a signal the
+ * indexer can receive.
+ */
+export async function loadContractSchemas(pool: Pool): Promise<Map<string, ContractSchema>> {
+  const { rows } = await pool.query<{ contract_id: string; definition: unknown }>(
+    'SELECT contract_id, definition FROM contract_schemas'
+  );
+
+  const schemas = new Map<string, ContractSchema>();
+  for (const row of rows) {
+    try {
+      schemas.set(row.contract_id, parseContractSchema(row.definition));
+    } catch (err) {
+      // A stored schema that no longer validates — because the rules tightened
+      // in a later release — must not stop every other contract from indexing.
+      console.error(
+        `Ignoring invalid stored schema for ${row.contract_id}:`,
+        err instanceof Error ? err.message : err
+      );
+    }
+  }
+  return schemas;
+}
+
+/** Register or replace a contract's schema. Validated before it is stored. */
+export async function upsertContractSchema(pool: Pool, schema: ContractSchema): Promise<void> {
+  await pool.query(
+    `INSERT INTO contract_schemas (contract_id, version, definition, updated_at)
+     VALUES ($1, $2, $3, NOW())
+     ON CONFLICT (contract_id) DO UPDATE SET
+       version = EXCLUDED.version,
+       definition = EXCLUDED.definition,
+       updated_at = NOW()`,
+    [schema.contractId, schema.version, JSON.stringify(schema)]
+  );
+}
+
+export async function deleteContractSchema(pool: Pool, contractId: string): Promise<void> {
+  await pool.query('DELETE FROM contract_schemas WHERE contract_id = $1', [contractId]);
+}
+
+/**
+ * Store decoded events.
+ *
+ * `ON CONFLICT DO UPDATE` rather than `DO NOTHING`, unlike the generic event
+ * insert: re-indexing the same event after a schema revision should produce the
+ * new decoding, and the old row would otherwise survive forever.
+ */
+export async function insertCustomEvents(pool: Pool, events: DecodedCustomEvent[]): Promise<void> {
+  if (events.length === 0) return;
+
+  for (const event of events) {
+    await pool.query(
+      `INSERT INTO custom_events
+         (event_id, contract_id, event_name, ledger, created_at, schema_version, fields)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (event_id, event_name) DO UPDATE SET
+         schema_version = EXCLUDED.schema_version,
+         fields = EXCLUDED.fields,
+         indexed_at = NOW()`,
+      [
+        event.eventId,
+        event.contractId,
+        event.eventName,
+        event.ledger,
+        event.createdAt,
+        event.schemaVersion,
+        // The whole point of the JSONB payload: field names travel as data,
+        // never as SQL identifiers.
+        JSON.stringify(event.fields),
+      ]
+    );
+  }
 }
