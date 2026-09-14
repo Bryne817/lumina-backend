@@ -1,6 +1,7 @@
 import { Pool, PoolClient } from 'pg';
 import type { HorizonAccount, HorizonLedger, HorizonOperation, HorizonTransaction } from './horizon';
 import type { ContractEvent } from './soroban';
+import { notifyIndexed } from './notify';
 
 export function createPool(databaseUrl: string): Pool {
   return new Pool({ connectionString: databaseUrl });
@@ -73,6 +74,16 @@ export async function indexLedger(
       await upsertAccount(client, account);
     }
 
+    // Queued inside the transaction on purpose: Postgres delivers notifications
+    // at commit, so a rolled-back ledger announces nothing and no subscriber is
+    // ever told about rows that did not land.
+    await notifyIndexed(client, {
+      kind: 'ledger',
+      ledger: ledger.sequence,
+      transactions: transactions.length,
+      operations: operations.length,
+    });
+
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
@@ -112,6 +123,12 @@ export async function upsertAccount(client: PoolClient, account: HorizonAccount)
 
 export async function insertContractEvents(pool: Pool, events: ContractEvent[]): Promise<void> {
   if (events.length === 0) return;
+
+  // Events arrive from Soroban RPC on their own cadence, keyed by the ledger
+  // they were emitted in — so the notification names the highest ledger in the
+  // batch, which is what a subscriber would read up to.
+  let highestLedger = 0;
+
   for (const event of events) {
     await pool.query(
       `INSERT INTO contract_events (id, type, contract_id, ledger, created_at, paging_token, topics, value)
@@ -128,7 +145,14 @@ export async function insertContractEvents(pool: Pool, events: ContractEvent[]):
         event.value === undefined ? null : JSON.stringify(event.value),
       ]
     );
+    if (event.ledger > highestLedger) highestLedger = event.ledger;
   }
+
+  await notifyIndexed(pool, {
+    kind: 'events',
+    ledger: highestLedger,
+    events: events.length,
+  });
 }
 
 export async function getLatestIndexedEventLedger(pool: Pool): Promise<number> {

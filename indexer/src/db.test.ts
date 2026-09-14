@@ -63,7 +63,17 @@ const op: HorizonOperation = {
 test('indexLedger writes ledger, transactions, and operations inside one commit', async () => {
   const { client, calls } = makeFakeClient();
   await indexLedger(fakePool(client), ledger, [tx], [op]);
-  assert.deepEqual(calls, ['BEGIN', 'ledgers', 'transactions', 'operations', 'COMMIT', 'RELEASE']);
+  // The notification is queued *inside* the transaction: Postgres delivers it
+  // at commit, so a rolled-back ledger announces nothing.
+  assert.deepEqual(calls, [
+    'BEGIN',
+    'ledgers',
+    'transactions',
+    'operations',
+    'SELECT pg_notify($1, $2)',
+    'COMMIT',
+    'RELEASE',
+  ]);
 });
 
 test('indexLedger rolls back and releases the client on failure', async () => {
@@ -97,7 +107,16 @@ const account: HorizonAccount = {
 test('indexLedger writes accounts inside the same commit when provided', async () => {
   const { client, calls } = makeFakeClient();
   await indexLedger(fakePool(client), ledger, [tx], [op], [account]);
-  assert.deepEqual(calls, ['BEGIN', 'ledgers', 'transactions', 'operations', 'accounts', 'COMMIT', 'RELEASE']);
+  assert.deepEqual(calls, [
+    'BEGIN',
+    'ledgers',
+    'transactions',
+    'operations',
+    'accounts',
+    'SELECT pg_notify($1, $2)',
+    'COMMIT',
+    'RELEASE',
+  ]);
 });
 
 test('upsertAccount inserts with an ON CONFLICT upsert', async () => {
@@ -123,8 +142,11 @@ test('insertContractEvents writes one row per event', async () => {
   const queries: string[] = [];
   const pool = { query: async (sql: string) => { queries.push(sql); return { rows: [] }; } } as unknown as Pool;
   await insertContractEvents(pool, [event, { ...event, id: 'evt2' }]);
-  assert.equal(queries.length, 2);
+  // Two inserts, then one notification announcing the batch.
+  assert.equal(queries.length, 3);
   assert.match(queries[0], /INSERT INTO contract_events/);
+  assert.match(queries[1], /INSERT INTO contract_events/);
+  assert.match(queries[2], /pg_notify/);
 });
 
 test('insertContractEvents is a no-op for an empty list', async () => {
