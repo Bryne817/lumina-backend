@@ -59,7 +59,7 @@ jobs:
       - run: psql postgresql://lumina:lumina_test@localhost:5432/lumina_test -f db/schema.sql
 
   subscriptions:
-    name: Subscriptions (live Postgres)
+    name: Integration (live Postgres)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -80,6 +80,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      - run: psql postgresql://lumina:lumina_test@localhost:5432/lumina_test -f db/schema.sql
       - run: npm ci
         working-directory: graphql-server
       # The unit tests fake the pg client, which cannot prove that Postgres
@@ -87,5 +88,13 @@ jobs:
       # events the reconnect supervisor listens for. These run the real thing.
       - run: npm run test:integration
         working-directory: graphql-server
+        env:
+          TEST_DATABASE_URL: postgresql://lumina:lumina_test@localhost:5432/lumina_test
+      - run: npm ci
+        working-directory: indexer
+      # The custom-schema round trip: register, index, and read back an i128
+      # through the same numeric predicate the query layer builds.
+      - run: npm run test:integration
+        working-directory: indexer
         env:
           TEST_DATABASE_URL: postgresql://lumina:lumina_test@localhost:5432/lumina_test

@@ -38,6 +38,21 @@ type Query {
 
   """Get the latest ledger."""
   latestLedger: Ledger
+
+  """
+  Events decoded against a contract's registered custom schema, with named,
+  typed fields rather than a raw JSON blob.
+  """
+  customEvents(
+    contractId: String!
+    event: String!
+    where: [CustomEventFilter!]
+    limit: Int = 20
+    cursor: String
+  ): CustomEventPage!
+
+  """The custom schema registered for a contract, if any."""
+  contractSchema(contractId: String!): ContractSchema
 }
 
 type Subscription {
@@ -189,4 +204,73 @@ enum OperationType {
   INVOKE_HOST_FUNCTION
   EXTEND_FOOTPRINT_TTL
   RESTORE_FOOTPRINT
+}
+
+# ─── Custom per-contract event schemas ───────────────────────────────────────
+
+enum FilterOp {
+  EQ
+  NE
+  GT
+  GTE
+  LT
+  LTE
+}
+
+"""
+One filter clause. `value` is a string for every type — see CustomEventField
+for why — and is coerced server-side using the type the schema declares.
+"""
+input CustomEventFilter {
+  field: String!
+  op: FilterOp!
+  value: String!
+}
+
+"""
+A decoded field.
+
+`value` is a string regardless of `type`, and deliberately so: the type this
+feature exists for is i128, which does not fit in a JSON number. Returning a
+Float would silently round token amounts above 2^53. `type` tells a client how
+to parse the string exactly.
+"""
+type CustomEventField {
+  name: String!
+  type: String!
+  value: String
+}
+
+type CustomEvent {
+  eventId: String!
+  contractId: String!
+  eventName: String!
+  ledger: Int!
+  createdAt: String!
+  schemaVersion: Int!
+  fields: [CustomEventField!]!
+}
+
+type CustomEventPage {
+  items: [CustomEvent!]!
+  pageInfo: PageInfo!
+}
+
+type SchemaField {
+  name: String!
+  type: String!
+  source: String!
+  optional: Boolean!
+}
+
+type SchemaEvent {
+  name: String!
+  topic: String!
+  fields: [SchemaField!]!
+}
+
+type ContractSchema {
+  contractId: String!
+  version: Int!
+  events: [SchemaEvent!]!
 }
