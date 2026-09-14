@@ -29,6 +29,47 @@ Stellar Horizon ──▶ indexer/ ──▶ PostgreSQL ──▶ graphql-server
               Lumina Registry (lumina-contracts) ─┘  (opt-in discovery, see below)
 ```
 
+### Real-time path
+
+Queries read from Postgres. Subscriptions add a push path alongside it, over
+Postgres `LISTEN`/`NOTIFY` — the indexer and the GraphQL server are separate
+processes, so an in-memory `PubSub` cannot join them, and both already hold a
+connection to the same database.
+
+```
+indexer/                          graphql-server/                   client
+   │                                    │                              │
+   │ BEGIN                              │ LISTEN lumina_indexed        │
+   │  INSERT ledger/txs/ops             │ (one supervised connection)  │
+   │  pg_notify('lumina_indexed', …)    │                              │
+   │ COMMIT ─────────────────────▶ notification ──▶ read that ledger   │
+   │                                    │           from Postgres      │
+   │                                    │              └──▶ push ─────▶│  ws://…/graphql
+```
+
+Two things are deliberate here:
+
+- **The notification is queued inside the writing transaction.** Postgres
+  delivers notifications at commit, so a rolled-back ledger announces nothing
+  and no subscriber is ever told about rows that did not land.
+- **The payload carries counts, not content.** Postgres caps a NOTIFY payload
+  at 8000 bytes and a busy ledger's transaction hashes alone exceed that, so the
+  notification names the ledger and the server reads the rows back out of the
+  database. One extra query per ledger (~5s apart) buys a payload that cannot
+  overflow or silently truncate.
+
+Subscriptions are served over `graphql-ws` at `ws://localhost:4000/graphql` —
+the same path and port as queries:
+
+```graphql
+subscription { newTransaction { hash ledger sourceAccount successful } }
+subscription { accountActivity(address: "G…") { id type amount asset } }
+```
+
+`accountActivity` matches operations that *touch* the address — `source_account`
+plus the counterparty fields in `details` — not merely those it submitted, so
+being paid counts.
+
 A [Lumina Registry](https://github.com/Lumeeena/lumina-contracts) is deployed
 on testnet at `CAYUDQPV3RKPM3EXDFGI3457FV677JLUCJ4OLKWGCUBPRIHYKXK3WFAZ` with
 one demo entry (itself), used to verify the discovery wiring below end-to-end
@@ -95,12 +136,36 @@ npm run dev
 |---|---|
 | `DATABASE_URL` | `postgresql://localhost:5432/lumina` |
 | `PORT` | `4000` |
+| `MAX_SUBSCRIPTIONS` | `500` — concurrent subscriptions before new ones are refused |
+| `SUBSCRIPTION_QUEUE_LIMIT` | `64` — notifications buffered per subscriber before the oldest are dropped |
+
+`MAX_SUBSCRIPTIONS` is a ceiling, not a lifetime budget: closing a subscription
+frees its slot. Past it, a new subscription is refused with a clear error rather
+than degrading every existing one.
+
+`SUBSCRIPTION_QUEUE_LIMIT` bounds what one stalled client — a paused browser
+tab, a wedged socket — can accumulate in the server's heap. Past it the *oldest*
+notifications are dropped, because on a live feed a client catching up wants the
+head of the stream, not a replay of a backlog it no longer cares about.
 
 ## Testing
 
 ```bash
 npm test   # runs indexer + graphql-server test suites
 ```
+
+The subscription integration tests need a real Postgres and are skipped without
+one, since they exist to check the things a faked `pg` client cannot: that
+Postgres actually delivers a NOTIFY, that a rolled-back one is never delivered,
+and that killing the listener's backend surfaces as the events the reconnect
+supervisor waits for.
+
+```bash
+TEST_DATABASE_URL=postgresql://lumina:lumina@localhost:5432/lumina \
+  npm run test:integration -w @lumina/graphql-server
+```
+
+CI runs them against its own Postgres service.
 
 ## License
 

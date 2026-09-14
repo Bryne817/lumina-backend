@@ -305,3 +305,41 @@ export async function getEventsByContract(
   );
   return rows.map(mapEvent);
 }
+
+/**
+ * Transactions belonging to one ledger, oldest first.
+ *
+ * Ordered ascending because a subscriber is replaying the ledger in the order
+ * it happened, which is the opposite of every paginated query above.
+ */
+export async function getTransactionsByLedger(pool: Pool, ledger: number) {
+  const { rows } = await pool.query<TransactionRow>(
+    'SELECT * FROM transactions WHERE ledger = $1 ORDER BY hash ASC',
+    [ledger]
+  );
+  return rows.map(mapTransaction);
+}
+
+/**
+ * Operations in one ledger that *touch* `address` — not merely those it
+ * submitted.
+ *
+ * `source_account` alone would miss the case people care about most: being paid.
+ * The counterparty fields live in the `details` JSONB, so they are matched
+ * there. `account` covers account creation/merge, `funder` covers a sponsored
+ * create.
+ */
+export async function getAccountOperationsInLedger(pool: Pool, ledger: number, address: string) {
+  const { rows } = await pool.query<OperationRow>(
+    `SELECT * FROM operations
+      WHERE ledger = $1
+        AND ( source_account = $2
+           OR details->>'from'    = $2
+           OR details->>'to'      = $2
+           OR details->>'account' = $2
+           OR details->>'funder'  = $2 )
+      ORDER BY id ASC`,
+    [ledger, address]
+  );
+  return rows.map(mapOperation);
+}

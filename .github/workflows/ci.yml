@@ -57,3 +57,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: psql postgresql://lumina:lumina_test@localhost:5432/lumina_test -f db/schema.sql
+
+  subscriptions:
+    name: Subscriptions (live Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: lumina_test
+          POSTGRES_USER: lumina
+          POSTGRES_PASSWORD: lumina_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lumina -d lumina_test"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+        working-directory: graphql-server
+      # The unit tests fake the pg client, which cannot prove that Postgres
+      # really delivers a NOTIFY or that a killed backend surfaces as the
+      # events the reconnect supervisor listens for. These run the real thing.
+      - run: npm run test:integration
+        working-directory: graphql-server
+        env:
+          TEST_DATABASE_URL: postgresql://lumina:lumina_test@localhost:5432/lumina_test

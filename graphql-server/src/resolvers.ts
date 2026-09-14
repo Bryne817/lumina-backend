@@ -13,9 +13,13 @@ import {
   mapAccount,
 } from './db';
 import { getAccount as getAccountFromHorizon, getLatestLedger as getLatestLedgerFromHorizon } from './horizon';
+import { createSubscriptionResolvers } from './subscriptions';
+import type { LedgerNotifier } from './pubsub';
 
 export interface Context {
   pool: Pool;
+  /** Present for websocket connections; absent for plain HTTP queries. */
+  notifier?: LedgerNotifier;
 }
 
 /**
@@ -44,6 +48,10 @@ async function resolveAccount(address: string, pool: Pool) {
 }
 
 export const resolvers = {
+  Subscription: createSubscriptionResolvers((message, detail) =>
+    console.warn(`[subscription] ${message}`, detail ?? '')
+  ),
+
   Query: {
     async transactions(_: unknown, args: { limit?: number; cursor?: string }, { pool }: Context) {
       const limit = args.limit ?? 20;
