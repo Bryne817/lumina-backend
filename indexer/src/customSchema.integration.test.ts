@@ -20,6 +20,13 @@ import type { ContractEvent } from './soroban';
 const DATABASE_URL = process.env.TEST_DATABASE_URL;
 const skip = DATABASE_URL ? false : 'TEST_DATABASE_URL is not set';
 
+/**
+ * A live-database test that stops making progress should fail with a name
+ * attached, not stall the whole run. The job also carries its own
+ * `timeout-minutes` as a second line of defence.
+ */
+const TEST_TIMEOUT_MS = 30_000;
+
 const CONTRACT = 'CAYUDQPV3RKPM3EXDFGI3457FV677JLUCJ4OLKWGCUBPRIHYKXK3WFAZ';
 const FROM = 'GFROMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
 const TO = 'GTOAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
@@ -72,7 +79,7 @@ after(async () => {
   await pool.end();
 });
 
-test('register → index → read back typed', { skip }, async () => {
+test('register → index → read back typed', { skip, timeout: TEST_TIMEOUT_MS }, async () => {
   const schema = parseContractSchema(schemaDoc);
   await upsertContractSchema(pool, schema);
 
@@ -98,7 +105,7 @@ test('register → index → read back typed', { skip }, async () => {
   assert.equal(rows[0].fields.from, FROM);
 });
 
-test('the numeric predicate the query layer builds compares an i128 exactly', { skip }, async () => {
+test('the numeric predicate the query layer builds compares an i128 exactly', { skip, timeout: TEST_TIMEOUT_MS }, async () => {
   // The seam that matters: text in JSONB, cast to numeric, compared against a
   // bound parameter. A bigint column would have overflowed here.
   const boundary = (BigInt(HUGE_AMOUNT) - 1n).toString();
@@ -114,7 +121,7 @@ test('the numeric predicate the query layer builds compares an i128 exactly', { 
   assert.deepEqual(rows.map(r => r.event_id), ['evt_huge']);
 });
 
-test('an exact-match filter finds the right rows', { skip }, async () => {
+test('an exact-match filter finds the right rows', { skip, timeout: TEST_TIMEOUT_MS }, async () => {
   const { rows } = await pool.query(
     `SELECT event_id FROM custom_events
       WHERE contract_id = $1 AND event_name = $2 AND fields->>$3 = $4`,
@@ -124,7 +131,7 @@ test('an exact-match filter finds the right rows', { skip }, async () => {
   assert.equal(rows.length, 2);
 });
 
-test('re-indexing after a schema revision replaces the decoded row', { skip }, async () => {
+test('re-indexing after a schema revision replaces the decoded row', { skip, timeout: TEST_TIMEOUT_MS }, async () => {
   // ON CONFLICT DO UPDATE rather than DO NOTHING: a revised schema has to be
   // able to correct what an earlier version stored, or the old decoding
   // survives forever.
@@ -156,7 +163,7 @@ test('re-indexing after a schema revision replaces the decoded row', { skip }, a
   assert.equal(rows[0].fields.from, undefined, 'a field dropped from the schema is gone');
 });
 
-test('a contract without a schema is untouched by any of this', { skip }, async () => {
+test('a contract without a schema is untouched by any of this', { skip, timeout: TEST_TIMEOUT_MS }, async () => {
   const other = 'CBYUDQPV3RKPM3EXDFGI3457FV677JLUCJ4OLKWGCUBPRIHYKXK3WFAZ';
   const loaded = await loadContractSchemas(pool);
 

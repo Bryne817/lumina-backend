@@ -61,6 +61,10 @@ jobs:
   subscriptions:
     name: Integration (live Postgres)
     runs-on: ubuntu-latest
+    # A hung test must fail fast rather than sit until the six-hour default.
+    # This job did exactly that: every test passed and the process then refused
+    # to exit, because a leaked Postgres connection kept the event loop alive.
+    timeout-minutes: 10
     services:
       postgres:
         image: postgres:16-alpine
