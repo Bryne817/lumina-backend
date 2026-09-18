@@ -104,21 +104,25 @@ export class LedgerNotifier {
     if (this.stopped || this.connecting) return;
     this.connecting = true;
 
+    // Hoisted so the catch can close a client whose connect() threw.
+    let client: ListenClient | null = null;
+
     try {
-      const client = this.createClient(this.options.connectionString);
+      client = this.createClient(this.options.connectionString);
+      const connecting = client;
 
       // Both handlers funnel into the same recovery path: from this class's
       // point of view a socket error and a clean server-side close are the
       // same event — the listener is gone and has to be rebuilt.
-      client.on('error', (err: Error) => {
+      connecting.on('error', (err: Error) => {
         this.log('LISTEN connection errored', err.message);
-        this.handleDisconnect(client);
+        this.handleDisconnect(connecting);
       });
-      client.on('end', () => {
+      connecting.on('end', () => {
         this.log('LISTEN connection ended');
-        this.handleDisconnect(client);
+        this.handleDisconnect(connecting);
       });
-      client.on('notification', msg => {
+      connecting.on('notification', msg => {
         if (msg.channel !== INDEXED_CHANNEL) return;
         const notification = parseNotification(msg.payload);
         // An unparseable payload is dropped, not thrown: a malformed
@@ -126,14 +130,28 @@ export class LedgerNotifier {
         if (notification) this.publish(notification);
       });
 
-      await client.connect();
-      await client.query(`LISTEN ${INDEXED_CHANNEL}`);
+      await connecting.connect();
+      await connecting.query(`LISTEN ${INDEXED_CHANNEL}`);
 
-      this.client = client;
+      // Two belt-and-braces cases, both of which would otherwise leak a live
+      // connection: a reconnect that raced with `stop()`, and a predecessor
+      // still assigned because its death was never observed.
+      if (this.stopped) {
+        await this.discard(connecting);
+        return;
+      }
+      if (this.client !== null && this.client !== connecting) {
+        await this.discard(this.client);
+      }
+
+      this.client = connecting;
       this.attempt = 0;
       this.log('listening for indexed ledgers');
     } catch (err) {
       this.log('LISTEN connection failed', err instanceof Error ? err.message : err);
+      // A half-open client from a failed connect holds a socket just as firmly
+      // as a working one.
+      if (client) await this.discard(client);
       this.client = null;
       this.scheduleReconnect();
     } finally {
@@ -141,12 +159,43 @@ export class LedgerNotifier {
     }
   }
 
+  /**
+   * Handle the death of a connection — but only if it is still *the*
+   * connection.
+   *
+   * A dying `pg.Client` emits both `error` and `end`, and both funnel here. The
+   * identity check has to reject the second one, which is why it compares
+   * against `client` rather than testing for null: after the first event
+   * `this.client` is already null, so a null-tolerant guard would let the
+   * duplicate through and schedule a *second* reconnect. Two timers then build
+   * two connections, the later one overwrites `this.client`, and the earlier
+   * one stays open forever — one leaked Postgres connection per reconnect,
+   * which eventually exhausts `max_connections`.
+   */
   private handleDisconnect(client: ListenClient): void {
-    // Ignore an event from a connection already replaced — otherwise a late
-    // 'end' from the old client cancels the new one.
-    if (this.client !== null && this.client !== client) return;
+    if (this.client !== client) return;
     this.client = null;
+
+    // Close the dead connection explicitly. It is already unusable, but `pg`
+    // does not always release the underlying socket on a failure it did not
+    // originate, and one retained socket is enough to keep the Node event loop
+    // alive forever — which is exactly how this surfaced: a CI job whose tests
+    // all passed and whose process then never exited.
+    //
+    // Re-entrancy is safe: `this.client` is nulled above, so the `end` event
+    // this triggers returns at the identity check.
+    void this.discard(client);
+
     if (!this.stopped) this.scheduleReconnect();
+  }
+
+  /** Close a connection we are abandoning, ignoring errors from an already-dead socket. */
+  private async discard(client: ListenClient): Promise<void> {
+    try {
+      await client.end();
+    } catch {
+      // Already gone; nothing useful left to do about it.
+    }
   }
 
   private scheduleReconnect(): void {

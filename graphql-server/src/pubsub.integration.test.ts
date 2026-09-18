@@ -20,6 +20,13 @@ import { LedgerNotifier } from './pubsub';
 const DATABASE_URL = process.env.TEST_DATABASE_URL;
 const skip = DATABASE_URL ? false : 'TEST_DATABASE_URL is not set';
 
+/**
+ * A live-database test that stops making progress should fail with a name
+ * attached, not stall the whole run. The job also carries its own
+ * `timeout-minutes` as a second line of defence.
+ */
+const TEST_TIMEOUT_MS = 30_000;
+
 /** Resolve the next notification, or reject if none arrives in time. */
 async function nextWithin<T>(stream: AsyncIterableIterator<T>, ms: number): Promise<T> {
   let timer: NodeJS.Timeout;
@@ -51,7 +58,7 @@ async function withNotifier(
   }
 }
 
-test('a real NOTIFY reaches a subscriber', { skip }, async () => {
+test('a real NOTIFY reaches a subscriber', { skip, timeout: TEST_TIMEOUT_MS }, async () => {
   await withNotifier(async (notifier, sender) => {
     const sub = notifier.subscribe();
 
@@ -67,7 +74,7 @@ test('a real NOTIFY reaches a subscriber', { skip }, async () => {
   });
 });
 
-test('a notification only arrives once its transaction commits', { skip }, async () => {
+test('a notification only arrives once its transaction commits', { skip, timeout: TEST_TIMEOUT_MS }, async () => {
   // This is the property that makes queueing the NOTIFY inside `indexLedger`'s
   // transaction correct: a rolled-back ledger must announce nothing.
   await withNotifier(async (notifier, sender) => {
@@ -92,7 +99,7 @@ test('a notification only arrives once its transaction commits', { skip }, async
   });
 });
 
-test('the listener recovers when its backend is terminated', { skip }, async () => {
+test('the listener recovers when its backend is terminated', { skip, timeout: TEST_TIMEOUT_MS }, async () => {
   await withNotifier(
     async (notifier, sender) => {
       const sub = notifier.subscribe();
@@ -126,7 +133,7 @@ test('the listener recovers when its backend is terminated', { skip }, async () 
   );
 });
 
-test('a malformed real notification does not kill the connection', { skip }, async () => {
+test('a malformed real notification does not kill the connection', { skip, timeout: TEST_TIMEOUT_MS }, async () => {
   await withNotifier(async (notifier, sender) => {
     const sub = notifier.subscribe();
 
@@ -142,7 +149,7 @@ test('a malformed real notification does not kill the connection', { skip }, asy
   });
 });
 
-test('every subscriber receives the same real notification', { skip }, async () => {
+test('every subscriber receives the same real notification', { skip, timeout: TEST_TIMEOUT_MS }, async () => {
   await withNotifier(async (notifier, sender) => {
     const subs = [notifier.subscribe(), notifier.subscribe(), notifier.subscribe()];
 

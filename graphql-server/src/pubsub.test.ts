@@ -353,3 +353,94 @@ test('publish is a no-op with no subscribers', async () => {
 
   await notifier.stop();
 });
+
+// ── Connection lifecycle (regression: leaked listeners) ────────────────────
+
+test('a dying client firing both error and end reconnects exactly once', async () => {
+  // The bug this pins: `pg.Client` emits *both* events when a connection dies.
+  // A null-tolerant identity guard let the second one through, scheduling a
+  // second reconnect. Two timers built two connections, the later overwrote
+  // the former, and the former stayed open forever — one leaked Postgres
+  // connection per reconnect, until `max_connections` ran out.
+  const { notifier, clients, runScheduled } = harness();
+  await notifier.start();
+
+  clients[0].handlers.error?.(new Error('connection terminated unexpectedly'));
+  clients[0].handlers.end?.();
+
+  await runScheduled();
+  await runScheduled();
+
+  assert.equal(clients.length, 2, 'error + end must produce one replacement, not two');
+  assert.equal(notifier.connected, true);
+
+  await notifier.stop();
+  assert.deepEqual(
+    clients.map(c => c.ended),
+    [true, true],
+    'both the dead original and its replacement are closed'
+  );
+});
+
+test('every client the notifier opens is closed by the time it stops', async () => {
+  // The invariant the CI hang exposed: a single unclosed client keeps the
+  // Node event loop alive, so `node --test` finishes its tests and then never
+  // exits.
+  const { notifier, clients, runScheduled } = harness();
+  await notifier.start();
+
+  for (let i = 0; i < 3; i++) {
+    clients[clients.length - 1].handlers.error?.(new Error('dropped'));
+    clients[clients.length - 1].handlers.end?.();
+    await runScheduled();
+  }
+
+  await notifier.stop();
+
+  const stillOpen = clients.filter(c => c.connected && !c.ended);
+  assert.deepEqual(stillOpen, [], `${stillOpen.length} client(s) left open`);
+});
+
+test('a client whose connect() throws is closed rather than left half-open', async () => {
+  const clients: FakeClient[] = [];
+  let pending: (() => void)[] = [];
+  let failNext = true;
+
+  const notifier = new LedgerNotifier({
+    connectionString: 'postgresql://test/lumina',
+    createClient: () => {
+      const client = new FakeClient(clients.length);
+      if (failNext) client.connectError = new Error('ECONNREFUSED');
+      clients.push(client);
+      return client;
+    },
+    schedule: fn => {
+      pending.push(fn);
+    },
+  });
+
+  await notifier.start();
+  assert.equal(clients[0].ended, true, 'the failed client must not keep its socket');
+
+  failNext = false;
+  const due = pending;
+  pending = [];
+  for (const fn of due) fn();
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(notifier.connected, true);
+  await notifier.stop();
+});
+
+test('a reconnect that lands after stop closes itself instead of lingering', async () => {
+  const { notifier, clients, runScheduled } = harness();
+  await notifier.start();
+
+  clients[0].handlers.error?.(new Error('dropped'));
+  // Shut down while the reconnect timer is still pending, then let it fire.
+  await notifier.stop();
+  await runScheduled();
+
+  const stillOpen = clients.filter(c => c.connected && !c.ended);
+  assert.deepEqual(stillOpen, [], 'a late reconnect must not outlive stop()');
+});

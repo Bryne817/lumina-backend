@@ -3,6 +3,11 @@
  * graphql-server's Horizon clients so this service has no cross-package imports.
  */
 
+import { horizonRequestDuration, horizonRequests } from './metrics';
+import { subsystem } from './logger';
+
+const log = subsystem('horizon');
+
 export const PAGE_LIMIT = 200;
 
 export interface HorizonLedger {
@@ -84,8 +89,28 @@ async function throttle(): Promise<void> {
 
 async function fetchJson<T>(url: string): Promise<T> {
   await throttle();
-  const res = await fetch(url);
+
+  // Every outbound Horizon request is counted by status. This is the metric
+  // that closes the gap from the rate-limiting incident: a 429 spike is a
+  // counter with a label, not an exception message in a log nobody tails.
+  const stopTimer = horizonRequestDuration.startTimer();
+  let res: Response;
+  try {
+    res = await fetch(url);
+  } catch (err) {
+    // A request that never got a response at all still has to be visible, or a
+    // DNS failure looks like silence.
+    horizonRequests.inc({ status: 'error' });
+    stopTimer();
+    throw err;
+  }
+  stopTimer();
+  horizonRequests.inc({ status: String(res.status) });
+
   if (!res.ok) {
+    if (res.status === 429) {
+      log.warn({ url, status: 429 }, 'horizon rate limited the request');
+    }
     throw new Error(`Horizon request failed (${res.status}): ${url}`);
   }
   return (await res.json()) as T;
@@ -126,9 +151,23 @@ export function getLedgerOperations(horizonUrl: string, sequence: number): Promi
 /** Returns null (rather than throwing) for accounts that don't exist or have been merged away. */
 export async function getAccount(horizonUrl: string, address: string): Promise<HorizonAccount | null> {
   await throttle();
-  const res = await fetch(`${horizonUrl}/accounts/${address}`);
+  // Counted here too — account lookups were the exact path the rate-limiting
+  // incident broke, and they bypass fetchJson because a 404 is expected rather
+  // than exceptional.
+  const stopTimer = horizonRequestDuration.startTimer();
+  let res: Response;
+  try {
+    res = await fetch(`${horizonUrl}/accounts/${address}`);
+  } catch (err) {
+    horizonRequests.inc({ status: 'error' });
+    stopTimer();
+    throw err;
+  }
+  stopTimer();
+  horizonRequests.inc({ status: String(res.status) });
+
   if (!res.ok) {
-    if (res.status !== 404) console.warn(`Horizon account fetch failed (${res.status}) for ${address}`);
+    if (res.status !== 404) log.warn({ address, status: res.status }, 'horizon account fetch failed');
     return null;
   }
   return (await res.json()) as HorizonAccount;

@@ -13,6 +13,18 @@ import { useServer } from 'graphql-ws/lib/use/ws';
 import { WebSocketServer } from 'ws';
 import { Context, resolvers } from './resolvers';
 import { LedgerNotifier, SubscriberLimitError } from './pubsub';
+import { subsystem } from './logger';
+import { buildServerHealth, metricsPlugin, samplePool, serverHealthStatusCode } from './observability';
+import {
+  listenerConnected,
+  metricsContentType,
+  renderMetrics,
+  subscriptionsActive,
+  subscriptionsRejected,
+} from './metrics';
+
+const log = subsystem('server');
+const startedAt = Date.now();
 
 const typeDefs = readFileSync(join(__dirname, 'schema.graphql'), 'utf-8');
 
@@ -28,7 +40,7 @@ const notifier = new LedgerNotifier({
   connectionString: DATABASE_URL,
   maxSubscribers: MAX_SUBSCRIPTIONS,
   queueLimit: SUBSCRIPTION_QUEUE_LIMIT,
-  log: (message, detail) => console.log(`[pubsub] ${message}`, detail ?? ''),
+  log: (message, detail) => subsystem('pubsub').info({ detail }, message),
 });
 
 async function main() {
@@ -47,13 +59,19 @@ async function main() {
       context: async (): Promise<Context> => ({ pool, notifier }),
       onError: (_ctx: unknown, _message: unknown, errors: readonly Error[]) => {
         for (const error of errors) {
-          console.error('[subscription] error', error.message);
+          log.error({ err: error.message }, 'subscription error');
         }
       },
       // A subscription refused for being over the cap should close cleanly with
       // a reason, not surface as an unhandled server error.
+      onComplete: () => {
+        subscriptionsActive.set(notifier.subscriberCount);
+      },
       onSubscribe: () => {
+        subscriptionsActive.set(notifier.subscriberCount);
         if (notifier.subscriberCount >= MAX_SUBSCRIPTIONS) {
+          subscriptionsRejected.inc();
+          log.warn({ limit: MAX_SUBSCRIPTIONS }, 'subscription refused at concurrency ceiling');
           // Returned as a GraphQLError so graphql-ws sends the client a proper
           // `error` message and closes the operation, rather than the
           // subscription failing later as an unhandled server error.
@@ -68,6 +86,7 @@ async function main() {
   const server = new ApolloServer<Context>({
     schema,
     plugins: [
+      metricsPlugin(),
       ApolloServerPluginDrainHttpServer({ httpServer }),
       {
         // Draining the websocket layer on shutdown as well, so a deploy does
@@ -87,6 +106,40 @@ async function main() {
   await server.start();
   await notifier.start();
 
+  // Ahead of the GraphQL middleware so an operator can always reach them, even
+  // while the schema layer is unhappy.
+  app.get('/health', (_req, res) => {
+    buildServerHealth({
+      pool,
+      startedAt,
+      listenerConnected: notifier.connected,
+      subscriptionCount: notifier.subscriberCount,
+    })
+      .then(report => {
+        listenerConnected.set(notifier.connected ? 1 : 0);
+        res.status(serverHealthStatusCode(report)).json(report);
+      })
+      .catch(err => {
+        log.error({ err: err instanceof Error ? err.message : err }, 'health check failed');
+        res.status(500).json({ status: 'degraded', error: 'health check failed' });
+      });
+  });
+
+  app.get('/metrics', (_req, res) => {
+    // Sampled at scrape time so the numbers describe this instant rather than
+    // whenever a background timer last fired.
+    samplePool(pool);
+    subscriptionsActive.set(notifier.subscriberCount);
+    listenerConnected.set(notifier.connected ? 1 : 0);
+
+    renderMetrics()
+      .then(body => res.set('Content-Type', metricsContentType()).send(body))
+      .catch(err => {
+        log.error({ err: err instanceof Error ? err.message : err }, 'failed to render metrics');
+        res.status(500).send('metrics unavailable');
+      });
+  });
+
   const middleware = [
     cors(),
     express.json(),
@@ -97,19 +150,25 @@ async function main() {
 
   await new Promise<void>(resolve => httpServer.listen({ port: PORT }, resolve));
 
-  console.log(`Lumina GraphQL server running at http://localhost:${PORT}/graphql`);
-  console.log(`Subscriptions at ws://localhost:${PORT}/graphql`);
-  console.log(`Database: ${DATABASE_URL}`);
+  log.info(
+    {
+      graphql: `http://localhost:${PORT}/graphql`,
+      subscriptions: `ws://localhost:${PORT}/graphql`,
+      health: `http://localhost:${PORT}/health`,
+      metrics: `http://localhost:${PORT}/metrics`,
+    },
+    'lumina graphql server listening'
+  );
 
   for (const signal of ['SIGINT', 'SIGTERM'] as const) {
     process.on(signal, () => {
-      console.log(`\n${signal} received — shutting down.`);
+      log.info({ signal }, 'shutting down');
       void server.stop().then(() => process.exit(0));
     });
   }
 }
 
 main().catch(err => {
-  console.error('Failed to start GraphQL server:', err);
+  log.fatal({ err: err instanceof Error ? err.message : err }, 'failed to start graphql server');
   process.exit(1);
 });
