@@ -15,6 +15,7 @@ import {
 import { getAccount as getAccountFromHorizon, getLatestLedger as getLatestLedgerFromHorizon } from './horizon';
 import { createSubscriptionResolvers } from './subscriptions';
 import { getContractSchema, getCustomEvents, type CustomEventFilter } from './customEvents';
+import { getOperationsByAsset, searchTransactions } from './search';
 import type { LedgerNotifier } from './pubsub';
 
 export interface Context {
@@ -76,16 +77,50 @@ export const resolvers = {
 
     async operations(
       _: unknown,
-      args: { account?: string; type?: string; limit?: number; cursor?: string },
+      args: { account?: string; type?: string; asset?: string; limit?: number; cursor?: string },
       { pool }: Context
     ) {
       const limit = args.limit ?? 20;
-      const items = await getOperations(pool, { account: args.account, type: args.type, limit, cursor: args.cursor });
+
+      // The asset filter needs its own query: an asset can appear as the
+      // payment asset or either side of an offer, which the generic operations
+      // query has no notion of.
+      const items = args.asset
+        ? await getOperationsByAsset(pool, {
+            asset: args.asset,
+            account: args.account,
+            type: args.type,
+            limit,
+            cursor: args.cursor,
+          })
+        : await getOperations(pool, { account: args.account, type: args.type, limit, cursor: args.cursor });
+
       return {
         items,
         pageInfo: {
           hasNextPage: items.length === limit,
           cursor: items.at(-1)?.id ?? null,
+        },
+      };
+    },
+
+    async search(
+      _: unknown,
+      args: { query: string; limit?: number; cursor?: string },
+      { pool }: Context
+    ) {
+      const limit = args.limit ?? 20;
+      const { items, nextCursor } = await searchTransactions(pool, {
+        query: args.query,
+        limit,
+        cursor: args.cursor,
+      });
+      return {
+        items,
+        pageInfo: {
+          hasNextPage: items.length === limit,
+          // The search cursor encodes the ranking tuple, not just a row id.
+          cursor: nextCursor,
         },
       };
     },

@@ -101,6 +101,61 @@ npm run register-schema -w @lumina/indexer -- apply transfer-schema.json
 See [docs/CUSTOM_SCHEMAS.md](docs/CUSTOM_SCHEMAS.md) for the format, a worked
 example, and what happens when a schema stops matching its contract.
 
+### Search and asset filtering
+
+Memo search, ranked by relevance:
+
+```graphql
+search(query: "ORDER-4471", limit: 20) {
+  items { hash memo ledger }
+  pageInfo { hasNextPage cursor }
+}
+```
+
+Ranking is **trigram similarity, not full-text search**. `to_tsvector` is built
+for prose — it stems words and discards short tokens — and Stellar memos are
+mostly not prose: order references, exchange deposit tags, invoice numbers.
+Stemming `ORDER-4471` is not merely unhelpful, it is wrong. Trigram treats the
+memo as a string, so substrings, typos and case differences all behave the same
+way, and one GIN index serves both ranking and `ILIKE`. An exact
+case-insensitive match is pinned above every fuzzy one, because pasting a full
+memo means looking for that transaction rather than things resembling it.
+
+Search cursors encode the ranking tuple rather than a row id, so a page
+boundary holds as new ledgers land. An `OFFSET` would shift every later page by
+one whenever a newly indexed transaction sorted earlier, duplicating a row
+across the seam.
+
+Filtering operations by asset:
+
+```graphql
+operations(asset: "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", limit: 20) {
+  items { id type amount asset }
+}
+```
+
+Use `XLM` (or `native`) for the native asset, which carries no code or issuer on
+an operation — without handling that explicitly the most common asset on the
+network would be unfindable. A filter matches the asset in all three roles it
+can appear in: the payment asset, and either side of an offer. Code and issuer
+are always matched together, which is the whole reason issuers exist.
+
+### Index migration time
+
+`db/migrations/004_search_indexes.sql` adds one GIN trigram index and three
+expression indexes. On a populated deployment the GIN build is the slow part, so
+the migration uses `CREATE INDEX CONCURRENTLY` — it takes longer but does not
+hold a write lock, so the indexer keeps running through it. That is also why the
+file has no `BEGIN`/`COMMIT`: `CONCURRENTLY` cannot run inside a transaction
+block.
+
+Expression indexes rather than generated columns for the asset fields: same
+effect for these queries, without rewriting every row in `operations`.
+
+```bash
+psql $DATABASE_URL -f db/migrations/004_search_indexes.sql
+```
+
 ## Run with Docker
 
 ```bash

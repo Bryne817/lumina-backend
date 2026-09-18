@@ -18,9 +18,20 @@ type Query {
   operations(
     account: String
     type: OperationType
+    """Filter to operations involving one asset: "CODE:ISSUER", or "XLM" for native."""
+    asset: String
     limit: Int = 20
     cursor: String
   ): OperationPage!
+
+  """
+  Search transactions by memo, ranked by relevance.
+
+  Ranking is trigram similarity rather than full-text search: Stellar memos are
+  order references and short codes rather than prose, and stemming an
+  identifier is wrong. An exact case-insensitive match always ranks first.
+  """
+  search(query: String!, limit: Int = 20, cursor: String): TransactionPage!
 
   """
   Fetch Soroban contract events by contract ID.
