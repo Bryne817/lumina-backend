@@ -140,3 +140,31 @@ CREATE INDEX IF NOT EXISTS idx_custom_events_ledger
 -- Containment queries on exact-match filters go through the payload directly.
 CREATE INDEX IF NOT EXISTS idx_custom_events_fields
     ON custom_events USING GIN (fields);
+
+-- ─── Search and asset-filter indexes ──────────────────────────────────────
+--
+-- Trigram rather than tsvector for memos: Stellar memos are order references
+-- and short codes rather than prose, and stemming an identifier is actively
+-- wrong. One GIN trigram index serves both similarity ranking and ILIKE.
+--
+-- The index definitions here omit CONCURRENTLY, which migration 004 uses —
+-- this file builds an empty database where the lock does not matter, and
+-- CONCURRENTLY cannot run inside the transaction psql wraps a script in.
+
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+CREATE INDEX IF NOT EXISTS idx_transactions_memo_trgm
+    ON transactions USING GIN (memo gin_trgm_ops)
+    WHERE memo IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_operations_asset_code
+    ON operations ((details->>'asset_code'))
+    WHERE details->>'asset_code' IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_operations_asset_issuer
+    ON operations ((details->>'asset_issuer'))
+    WHERE details->>'asset_issuer' IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_operations_asset_type
+    ON operations ((details->>'asset_type'))
+    WHERE details->>'asset_type' IS NOT NULL;

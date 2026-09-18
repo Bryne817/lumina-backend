@@ -16,7 +16,7 @@ interface LedgerRow {
   base_reserve: string;
 }
 
-interface TransactionRow {
+export interface TransactionRow {
   hash: string;
   ledger: string;
   created_at: Date;
@@ -28,7 +28,7 @@ interface TransactionRow {
   memo: string | null;
 }
 
-interface OperationRow {
+export interface OperationRow {
   id: string;
   type: string;
   transaction_hash: string;
