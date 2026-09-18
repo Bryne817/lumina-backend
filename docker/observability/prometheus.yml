@@ -1,0 +1,21 @@
+# Scrapes both Lumina services. Both expose /metrics on their own port, so the
+# indexer needs no ingress of its own beyond the compose network.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: lumina-indexer
+    static_configs:
+      - targets: ["indexer:9090"]
+        labels:
+          service: indexer
+
+  - job_name: lumina-graphql
+    static_configs:
+      - targets: ["graphql:4000"]
+        labels:
+          service: graphql

@@ -1,0 +1,74 @@
+# Alerting thresholds, kept beside the dashboard so "what counts as unhealthy"
+# has exactly one definition. These mirror the indexer's own /health
+# thresholds — a page and a failing container healthcheck should not disagree.
+groups:
+  - name: lumina-indexing
+    rules:
+      - alert: IndexingStalled
+        # The failure that actually happens: the loop runs and stops making
+        # progress. Nothing else distinguishes it from a healthy service.
+        expr: time() - lumina_last_successful_index_timestamp_seconds > 60
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Indexer has not written a ledger in over a minute"
+          runbook: "See README — 'Indexing lag is high'"
+
+      - alert: IndexingLagHigh
+        expr: lumina_indexing_lag_ledgers > 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Indexer is more than 20 ledgers behind Horizon"
+          runbook: "See README — 'Indexing lag is high'"
+
+      - alert: HorizonRateLimited
+        # The incident this whole layer exists because of. A sustained 429 rate
+        # silently breaks account lookups.
+        expr: rate(lumina_horizon_requests_total{status="429"}[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Horizon is rate limiting us"
+          runbook: "Raise HORIZON_MIN_REQUEST_INTERVAL_MS; see README"
+
+      - alert: IndexingErrorRateHigh
+        expr: rate(lumina_indexing_errors_total[5m]) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Indexer loops are erroring repeatedly"
+
+  - name: lumina-graphql
+    rules:
+      - alert: DatabasePoolExhausted
+        # Queries queue invisibly once every connection is checked out; latency
+        # climbs with no error to point at.
+        expr: lumina_db_pool_waiting > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GraphQL requests are queuing for a database connection"
+
+      - alert: SubscriptionListenerDown
+        expr: lumina_graphql_listener_connected == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Postgres LISTEN connection is down; subscriptions are paused"
+
+      - alert: GraphQLErrorRateHigh
+        expr: |
+          sum(rate(lumina_graphql_operations_total{outcome="error"}[5m]))
+            / clamp_min(sum(rate(lumina_graphql_operations_total[5m])), 0.001) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 5% of GraphQL operations are failing"

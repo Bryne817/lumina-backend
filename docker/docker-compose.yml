@@ -12,6 +12,12 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ../db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lumina -d lumina"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   # Lumina Indexer — polls Horizon and writes to PostgreSQL
   indexer:
@@ -20,7 +26,8 @@ services:
       dockerfile: docker/Dockerfile.indexer
     restart: unless-stopped
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://lumina:lumina_dev@postgres:5432/lumina
       HORIZON_URL: https://horizon.stellar.org
@@ -38,6 +45,21 @@ services:
       INDEXED_CONTRACT_IDS: "CAYUDQPV3RKPM3EXDFGI3457FV677JLUCJ4OLKWGCUBPRIHYKXK3WFAZ"
       REGISTRY_CONTRACT_ID: "CAYUDQPV3RKPM3EXDFGI3457FV677JLUCJ4OLKWGCUBPRIHYKXK3WFAZ"
       REGISTRY_READ_ACCOUNT: "GBWKFFXZ5CJESIHP2EOID5IOXMF472RO5XOJ36X475D5LJGI3AF5R5KY"
+      HEALTH_PORT: "9090"
+    expose:
+      - "9090"
+    # Health here means *progress*, not liveness: `/health` answers 503 once no
+    # ledger has been indexed for HEALTH_MAX_SECONDS_SINCE_INDEX. A wedged
+    # polling loop is the failure that actually happens, and to `docker ps` it
+    # is indistinguishable from a healthy one without this.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      # Generous, because a cold start reads Horizon's tip before it can index
+      # anything and should not be killed while doing so.
+      start_period: 60s
 
   # Lumina GraphQL Server — serves indexed data via GraphQL API
   graphql:
@@ -46,12 +68,58 @@ services:
       dockerfile: docker/Dockerfile.graphql
     restart: unless-stopped
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://lumina:lumina_dev@postgres:5432/lumina
       PORT: "4000"
     ports:
       - "127.0.0.1:4000:4000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ── Observability stack ──────────────────────────────────────────────────
+  #
+  # Opt-in, so the default `docker compose up` stays the three services it has
+  # always been:
+  #
+  #   docker compose -f docker/docker-compose.yml --profile observability up
+  #
+  # Grafana lands on http://localhost:3001 (admin/admin) with the Lumina
+  # dashboard already provisioned.
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    profiles: ["observability"]
+    restart: unless-stopped
+    depends_on:
+      - indexer
+      - graphql
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "127.0.0.1:9091:9090"
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    profiles: ["observability"]
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./observability/grafana-datasource.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro
+      - ./observability/grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/lumina.yml:ro
+      - ./observability/lumina-dashboard.json:/var/lib/grafana/dashboards/lumina-dashboard.json:ro
+    ports:
+      - "127.0.0.1:3001:3000"
 
 volumes:
   postgres_data:

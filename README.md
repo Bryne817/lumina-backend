@@ -156,12 +156,24 @@ REGISTRY_READ_ACCOUNT=<any funded testnet G... address> \
 npm run dev
 ```
 
+### Indexer observability environment variables
+
+| Variable | Default |
+|---|---|
+| `HEALTH_PORT` | `9090` — port serving `/health`, `/ready` and `/metrics` |
+| `HEALTH_MAX_SECONDS_SINCE_INDEX` | `60` — stall threshold before `/health` reports 503 |
+| `HEALTH_MAX_LAG_LEDGERS` | `20` — lag threshold before `/health` reports 503 |
+| `LOG_LEVEL` | `info` |
+| `LOG_PRETTY` | unset — `true` for human-readable local logs |
+
 ### GraphQL server environment variables
 
 | Variable | Default |
 |---|---|
 | `DATABASE_URL` | `postgresql://localhost:5432/lumina` |
 | `PORT` | `4000` |
+| `LOG_LEVEL` | `info` — `debug` for per-ledger detail |
+| `LOG_PRETTY` | unset — `true` for human-readable local logs |
 | `MAX_SUBSCRIPTIONS` | `500` — concurrent subscriptions before new ones are refused |
 | `SUBSCRIPTION_QUEUE_LIMIT` | `64` — notifications buffered per subscriber before the oldest are dropped |
 
@@ -173,6 +185,88 @@ than degrading every existing one.
 tab, a wedged socket — can accumulate in the server's heap. Past it the *oldest*
 notifications are dropped, because on a live feed a client catching up wants the
 head of the stream, not a replay of a backlog it no longer cares about.
+
+## Observability
+
+Both services expose Prometheus metrics and a real health endpoint. `docker
+compose ps` reports accurate health rather than "running", because the checks
+measure *progress* rather than liveness — a polling loop that is up and no
+longer writing ledgers is the failure that actually happens, and it is
+indistinguishable from a healthy one without this.
+
+| Endpoint | Service |
+| --- | --- |
+| `http://localhost:4000/health` | GraphQL server — runs a real `SELECT 1` |
+| `http://localhost:4000/metrics` | GraphQL server |
+| `http://localhost:9090/health` | Indexer — 503 once indexing stalls |
+| `http://localhost:9090/ready` | Indexer — 503 until the first ledger lands |
+| `http://localhost:9090/metrics` | Indexer |
+
+Run the local stack with Prometheus and a provisioned Grafana dashboard:
+
+```bash
+docker compose -f docker/docker-compose.yml --profile observability up
+```
+
+Grafana is on http://localhost:3001 (admin/admin), Prometheus on
+http://localhost:9091. The dashboard, datasource and alert rules are checked in
+under `docker/observability/`.
+
+Logs are structured JSON via `pino`, with values as fields rather than
+interpolated into the message, so a ledger number is queryable rather than
+greppable. `LOG_LEVEL` sets verbosity and `LOG_PRETTY=true` gives readable
+output locally.
+
+### What "unhealthy" means
+
+Thresholds live in one place — `docker/observability/alerts.yml` — and the
+services' own health checks mirror them, so a page, a red container and a red
+dashboard panel never disagree.
+
+| Condition | Threshold | Severity |
+| --- | --- | --- |
+| No ledger indexed | > 60s | critical |
+| Behind Horizon | > 20 ledgers for 5m | warning |
+| Horizon 429 rate | > 0.1/s for 5m | warning |
+| Indexing errors | > 0.05/s for 10m | warning |
+| Queries waiting on a DB connection | any, for 5m | warning |
+| LISTEN connection down | > 5m | warning |
+| GraphQL error ratio | > 5% for 10m | warning |
+
+Both indexer thresholds are configurable with
+`HEALTH_MAX_SECONDS_SINCE_INDEX` and `HEALTH_MAX_LAG_LEDGERS`.
+
+### Runbook: indexing lag is high
+
+1. **Check whether it is Horizon rate limiting.** Look at
+   `lumina_horizon_requests_total{status="429"}` — this is the metric the whole
+   layer exists for, because a sustained 429 rate silently breaks account
+   lookups and used to be visible only in raw logs. If it is non-zero, raise
+   `HORIZON_MIN_REQUEST_INTERVAL_MS` (the default of 1000ms is already
+   conservative for anonymous access; public Horizon 429s even at 10 req/sec
+   sustained).
+2. **Check whether the indexer is writing at all.**
+   `time() - lumina_last_successful_index_timestamp_seconds` climbing without
+   bound means the loop is wedged rather than slow. `curl localhost:9090/health`
+   names the failing check.
+3. **Check the database.** `/health` reports `database: unreachable` when the
+   pool cannot answer `SELECT 1`. On the GraphQL side,
+   `lumina_db_pool_waiting > 0` means queries are queuing for a connection — a
+   latency cliff with no error to point at.
+4. **Check how long writes are taking.**
+   `lumina_ledger_index_duration_seconds` p95 rising alongside a healthy
+   Horizon points at Postgres, not the network.
+5. **Check which loop is failing.** `lumina_indexing_errors_total` is labelled
+   by loop (`ledger`, `registry`, `contract-events`, `custom-schema`), so a
+   broken custom schema is distinguishable from a Horizon outage.
+
+### Runbook: subscriptions stopped delivering
+
+`lumina_graphql_listener_connected` at 0 means the Postgres `LISTEN` connection
+is down and reconnecting; queries are unaffected and this is not fatal to
+health. If it stays down, check Postgres connectivity from the GraphQL
+container. `lumina_graphql_subscriptions_rejected_total` increasing means
+clients are hitting the `MAX_SUBSCRIPTIONS` ceiling.
 
 ## Testing
 
