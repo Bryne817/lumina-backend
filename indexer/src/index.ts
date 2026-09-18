@@ -30,6 +30,28 @@ import {
   loadContractSchemas,
 } from './db';
 import { decodeEvents } from './customDecode';
+import { subsystem } from './logger';
+import {
+  contractEventsIndexed,
+  customEventsDecoded,
+  indexingErrors,
+  ledgerIndexDuration,
+  recordHorizonTip,
+  recordIndexedLedger,
+} from './metrics';
+import { startHealthServer, type IndexerState } from './health';
+
+const log = subsystem('indexer');
+
+const HEALTH_PORT = parseInt(process.env.HEALTH_PORT ?? '9090', 10);
+
+/** Live state the health endpoint reports on. */
+const state: IndexerState = {
+  latestIndexedLedger: 0,
+  latestHorizonLedger: 0,
+  lastIndexedAt: null,
+  startedAt: Date.now(),
+};
 import { getAccount, getLatestLedgerSequence, getLedger, getLedgerOperations, getLedgerTransactions, HorizonAccount } from './horizon';
 import { getActiveContracts } from './registry';
 import { getEvents, getLatestLedgerSequence as getLatestRpcLedgerSequence, type ContractEvent } from './soroban';
@@ -89,7 +111,7 @@ function pruneAccountCache(now: number): void {
 }
 
 async function fetchAndIndexLedger(sequence: number): Promise<void> {
-  console.log(`Indexing ledger ${sequence}...`);
+  log.debug({ ledger: sequence }, 'indexing ledger');
   const [ledger, transactions, operations] = await Promise.all([
     getLedger(HORIZON_URL, sequence),
     getLedgerTransactions(HORIZON_URL, sequence),
@@ -112,7 +134,13 @@ async function fetchAndIndexLedger(sequence: number): Promise<void> {
   ).filter((a): a is HorizonAccount => a !== null);
   for (const address of addressesToFetch) accountCache.set(address, now);
 
+  const stopTimer = ledgerIndexDuration.startTimer();
   await indexLedger(pool, ledger, transactions, operations, accounts);
+  stopTimer();
+
+  state.latestIndexedLedger = sequence;
+  state.lastIndexedAt = Date.now();
+  recordIndexedLedger(sequence, transactions.length, operations.length);
 }
 
 async function fetchAndIndexLedgerWithRetry(sequence: number): Promise<void> {
@@ -122,11 +150,15 @@ async function fetchAndIndexLedgerWithRetry(sequence: number): Promise<void> {
       return;
     } catch (err) {
       if (attempt === LEDGER_RETRY_ATTEMPTS) {
-        console.error(`Giving up on ledger ${sequence} after ${attempt} attempts:`, err);
+        indexingErrors.inc({ loop: 'ledger' });
+        log.error({ ledger: sequence, attempts: attempt, err: message(err) }, 'giving up on ledger');
         return;
       }
       const delay = LEDGER_RETRY_BASE_MS * 2 ** (attempt - 1);
-      console.error(`Ledger ${sequence} failed (attempt ${attempt}/${LEDGER_RETRY_ATTEMPTS}), retrying in ${delay}ms:`, err);
+      log.warn(
+        { ledger: sequence, attempt, maxAttempts: LEDGER_RETRY_ATTEMPTS, retryInMs: delay, err: message(err) },
+        'ledger failed, retrying'
+      );
       await new Promise(r => setTimeout(r, delay));
     }
   }
@@ -155,12 +187,13 @@ async function pollRegistry(): Promise<void> {
     );
     const invalid = entries.filter(id => !isContractAddress(id));
     if (invalid.length > 0) {
-      console.warn(`Registry discovery: skipping ${invalid.length} registered entr(y/ies) with a non-contract address:`, invalid);
+      log.warn({ count: invalid.length, addresses: invalid }, 'registry discovery skipped non-contract addresses');
     }
     discoveredContractIds = entries.filter(isContractAddress);
-    console.log(`Registry discovery: ${discoveredContractIds.length} active contract(s)`);
+    log.info({ contracts: discoveredContractIds.length }, 'registry discovery complete');
   } catch (err) {
-    console.error('Registry polling error:', err);
+    indexingErrors.inc({ loop: 'registry' });
+    log.error({ err: message(err) }, 'registry polling failed');
   }
 }
 
@@ -184,19 +217,21 @@ async function pollContractEvents(): Promise<void> {
         // empty (no error) for startLedger values too far behind current, and how
         // far is "too far" is provider-specific and not worth hardcoding a guess at.
         eventsCursor = await getLatestRpcLedgerSequence(SOROBAN_RPC_URL);
-        console.log(`Contract event indexing: starting from latest RPC ledger ${eventsCursor}`);
+        log.info({ ledger: eventsCursor }, 'contract event indexing starting from latest RPC ledger');
       }
     }
 
     const { events, latestLedger } = await getEvents(SOROBAN_RPC_URL, contractIds, eventsCursor);
     if (events.length > 0) {
-      console.log(`Indexing ${events.length} contract event(s) from ledger ${eventsCursor}...`);
+      log.info({ events: events.length, fromLedger: eventsCursor }, 'indexing contract events');
+      contractEventsIndexed.inc(events.length);
       await insertContractEvents(pool, events);
       await indexCustomEvents(events);
     }
     eventsCursor = Math.max(eventsCursor, latestLedger - EVENTS_SAFETY_LAG_LEDGERS + 1);
   } catch (err) {
-    console.error('Contract event polling error:', err);
+    indexingErrors.inc({ loop: 'contract-events' });
+    log.error({ err: message(err) }, 'contract event polling failed');
   }
 }
 
@@ -222,34 +257,37 @@ async function indexCustomEvents(events: ContractEvent[]): Promise<void> {
     for (const failure of failures) {
       // A matched event that will not decode means the schema and the contract
       // have diverged — loud, because it is silently wrong data otherwise.
-      console.warn(
-        `Custom schema decode failed for event ${failure.eventId} (${failure.eventName}): ${failure.reason}`
+      customEventsDecoded.inc({ outcome: 'failed' });
+      log.warn(
+        { eventId: failure.eventId, event: failure.eventName, reason: failure.reason },
+        'custom schema decode failed; schema and contract have diverged'
       );
     }
 
     if (decoded.length > 0) {
-      console.log(`Decoded ${decoded.length} event(s) against custom schemas.`);
+      log.info({ decoded: decoded.length }, 'decoded events against custom schemas');
+      customEventsDecoded.inc({ outcome: 'decoded' }, decoded.length);
       await insertCustomEvents(pool, decoded);
     }
   } catch (err) {
-    console.error('Custom schema indexing error (generic indexing unaffected):', err);
+    indexingErrors.inc({ loop: 'custom-schema' });
+    log.error({ err: message(err) }, 'custom schema indexing failed; generic indexing unaffected');
   }
 }
 
 async function run() {
-  console.log('Lumina Indexer starting...');
-  console.log(`Horizon: ${HORIZON_URL}`);
-  console.log(`Database: ${DATABASE_URL}`);
+  log.info({ horizon: HORIZON_URL, database: redactUrl(DATABASE_URL), healthPort: HEALTH_PORT }, 'lumina indexer starting');
+  startHealthServer({ port: HEALTH_PORT, getState: () => state, pool });
 
   let cursor = await getLatestIndexedLedger(pool);
   if (cursor === 0 && START_LEDGER !== undefined) {
     cursor = START_LEDGER - 1;
-    console.log(`Starting from configured START_LEDGER: ${START_LEDGER}`);
+    log.info({ ledger: START_LEDGER }, 'starting from configured START_LEDGER');
   } else if (cursor === 0) {
     cursor = await getLatestLedgerSequence(HORIZON_URL);
-    console.log(`Starting from latest ledger: ${cursor + 1}`);
+    log.info({ ledger: cursor + 1 }, 'starting from latest ledger');
   } else {
-    console.log(`Resuming from ledger: ${cursor + 1}`);
+    log.info({ ledger: cursor + 1 }, 'resuming from ledger');
   }
 
   while (true) {
@@ -260,14 +298,19 @@ async function run() {
       loopTick++;
 
       const latest = await getLatestLedgerSequence(HORIZON_URL);
+      state.latestHorizonLedger = latest;
+      recordHorizonTip(latest, state.latestIndexedLedger || cursor);
+
       for (let seq = cursor + 1; seq <= latest; seq++) {
         await fetchAndIndexLedgerWithRetry(seq);
         cursor = seq;
+        recordHorizonTip(latest, cursor);
       }
 
       await pollContractEvents();
     } catch (err) {
-      console.error('Indexer error:', err);
+      indexingErrors.inc({ loop: 'main' });
+      log.error({ err: message(err) }, 'indexer loop error');
     }
 
     await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
@@ -275,7 +318,7 @@ async function run() {
 }
 
 async function shutdown() {
-  console.log('Shutting down indexer...');
+  log.info('shutting down indexer');
   await pool.end();
   process.exit(0);
 }
@@ -284,6 +327,22 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 run().catch(err => {
-  console.error('Fatal indexer error:', err);
+  log.fatal({ err: message(err) }, 'fatal indexer error');
   process.exit(1);
 });
+
+/** Errors are logged as a field, not interpolated, so they stay queryable. */
+function message(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Never log a database URL with its password in it. */
+function redactUrl(url: string): string {
+  try {
+    const parsed = new URL(url);
+    if (parsed.password) parsed.password = '***';
+    return parsed.toString();
+  } catch {
+    return '(unparseable)';
+  }
+}

@@ -2,6 +2,9 @@ import { Pool, PoolClient } from 'pg';
 import type { HorizonAccount, HorizonLedger, HorizonOperation, HorizonTransaction } from './horizon';
 import type { ContractEvent } from './soroban';
 import { notifyIndexed } from './notify';
+import { subsystem } from './logger';
+
+const log = subsystem('db');
 import { parseContractSchema, type ContractSchema } from './customSchema';
 import type { DecodedCustomEvent } from './customDecode';
 
@@ -184,9 +187,9 @@ export async function loadContractSchemas(pool: Pool): Promise<Map<string, Contr
     } catch (err) {
       // A stored schema that no longer validates — because the rules tightened
       // in a later release — must not stop every other contract from indexing.
-      console.error(
-        `Ignoring invalid stored schema for ${row.contract_id}:`,
-        err instanceof Error ? err.message : err
+      log.error(
+        { contractId: row.contract_id, err: err instanceof Error ? err.message : String(err) },
+        'ignoring invalid stored schema'
       );
     }
   }
