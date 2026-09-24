@@ -145,25 +145,46 @@ async function fetchAndIndexLedger(sequence: number): Promise<void> {
   recordIndexedLedger(sequence, transactions.length, operations.length);
 }
 
-async function fetchAndIndexLedgerWithRetry(sequence: number): Promise<void> {
-  for (let attempt = 1; attempt <= LEDGER_RETRY_ATTEMPTS; attempt++) {
+export async function fetchAndIndexLedgerWithRetry(
+  sequence: number,
+  indexOne: (sequence: number) => Promise<void> = fetchAndIndexLedger,
+  retryAttempts = LEDGER_RETRY_ATTEMPTS,
+  retryBaseMs = LEDGER_RETRY_BASE_MS
+): Promise<boolean> {
+  for (let attempt = 1; attempt <= retryAttempts; attempt++) {
     try {
-      await fetchAndIndexLedger(sequence);
-      return;
+      await indexOne(sequence);
+      return true;
     } catch (err) {
-      if (attempt === LEDGER_RETRY_ATTEMPTS) {
+      if (attempt === retryAttempts) {
         indexingErrors.inc({ loop: 'ledger' });
         log.error({ ledger: sequence, attempts: attempt, err: message(err) }, 'giving up on ledger');
-        return;
+        return false;
       }
-      const delay = LEDGER_RETRY_BASE_MS * 2 ** (attempt - 1);
+      const delay = retryBaseMs * 2 ** (attempt - 1);
       log.warn(
-        { ledger: sequence, attempt, maxAttempts: LEDGER_RETRY_ATTEMPTS, retryInMs: delay, err: message(err) },
+        { ledger: sequence, attempt, maxAttempts: retryAttempts, retryInMs: delay, err: message(err) },
         'ledger failed, retrying'
       );
       await new Promise(r => setTimeout(r, delay));
     }
   }
+  return false;
+}
+
+export async function runLedgerCatchUp(
+  cursor: number,
+  latest: number,
+  indexOne: (sequence: number) => Promise<boolean> = fetchAndIndexLedgerWithRetry,
+  onAdvanced: (cursor: number) => void = () => {}
+): Promise<number> {
+  for (let seq = cursor + 1; seq <= latest; seq++) {
+    const indexed = await indexOne(seq);
+    if (!indexed) break;
+    cursor = seq;
+    onAdvanced(cursor);
+  }
+  return cursor;
 }
 
 /**
@@ -305,11 +326,7 @@ async function run() {
       state.latestHorizonLedger = latest;
       recordHorizonTip(latest, state.latestIndexedLedger || cursor);
 
-      for (let seq = cursor + 1; seq <= latest; seq++) {
-        await fetchAndIndexLedgerWithRetry(seq);
-        cursor = seq;
-        recordHorizonTip(latest, cursor);
-      }
+      cursor = await runLedgerCatchUp(cursor, latest, undefined, advanced => recordHorizonTip(latest, advanced));
 
       await pollContractEvents();
     } catch (err) {
@@ -332,16 +349,15 @@ async function shutdown() {
   process.exit(0);
 }
 
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+if (require.main === module) {
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 
-run().catch(err => {
-  log.fatal({ err: message(err) }, 'fatal indexer error');
-  if (err instanceof Error) {
-    captureException(err, { fatal: true });
-  }
-  process.exit(1);
-});
+  run().catch(err => {
+    log.fatal({ err: message(err) }, 'fatal indexer error');
+    process.exit(1);
+  });
+}
 
 /** Errors are logged as a field, not interpolated, so they stay queryable. */
 function message(err: unknown): string {

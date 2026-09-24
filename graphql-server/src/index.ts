@@ -11,7 +11,7 @@ import { Pool } from 'pg';
 import { GraphQLError } from 'graphql';
 import { useServer } from 'graphql-ws/lib/use/ws';
 import { WebSocketServer } from 'ws';
-import { Context as BaseContext, resolvers } from './resolvers';
+import { Context, createContext, resolvers } from './resolvers';
 import { LedgerNotifier, SubscriberLimitError } from './pubsub';
 import { subsystem } from './logger';
 import { buildServerHealth, metricsPlugin, samplePool, serverHealthStatusCode } from './observability';
@@ -67,11 +67,7 @@ async function main() {
   const wsCleanup = useServer(
     {
       schema,
-      context: async (ctx): Promise<Context> => {
-        const correlationId = (ctx.connectionParams?.['x-correlation-id'] as string) || uuidv4();
-        const requestLogger = subsystem('subscription', correlationId);
-        return { pool, notifier, correlationId, requestLogger };
-      },
+      context: async (): Promise<Context> => createContext(pool, { notifier }),
       onError: (_ctx: unknown, _message: unknown, errors: readonly Error[]) => {
         for (const error of errors) {
           log.error({ err: error.message }, 'subscription error');
@@ -158,13 +154,7 @@ async function main() {
   const middleware = [
     cors(),
     express.json(),
-    expressMiddleware(server, {
-      context: async ({ req }) => {
-        const correlationId = (req.headers['x-correlation-id'] as string) || uuidv4();
-        const requestLogger = subsystem('graphql', correlationId);
-        return { pool, notifier, correlationId, requestLogger };
-      },
-    }),
+    expressMiddleware(server, { context: async () => createContext(pool) }),
   ];
   app.use('/graphql', ...middleware);
   app.use('/', ...middleware);

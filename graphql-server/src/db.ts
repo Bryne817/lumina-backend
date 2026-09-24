@@ -200,6 +200,12 @@ export async function getTransactionByHash(pool: Pool, hash: string) {
   return rows[0] ? mapTransaction(rows[0]) : null;
 }
 
+export async function getTransactionsByHashes(pool: Pool, hashes: readonly string[]) {
+  if (hashes.length === 0) return new Map<string, ReturnType<typeof mapTransaction>>();
+  const { rows } = await pool.query<TransactionRow>('SELECT * FROM transactions WHERE hash = ANY($1::text[])', [hashes]);
+  return new Map(rows.map(row => [row.hash, mapTransaction(row)]));
+}
+
 export async function getOperations(
   pool: Pool,
   opts: { account?: string | null; type?: string | null; limit: number; cursor?: string | null }
@@ -238,9 +244,31 @@ export async function getOperationsByTransactionHash(pool: Pool, hash: string) {
   return rows.map(mapOperation);
 }
 
+export async function getOperationsByTransactionHashes(pool: Pool, hashes: readonly string[]) {
+  if (hashes.length === 0) return new Map<string, ReturnType<typeof mapOperation>[]>();
+  const { rows } = await pool.query<OperationRow>(
+    'SELECT * FROM operations WHERE transaction_hash = ANY($1::text[]) ORDER BY transaction_hash ASC, id ASC',
+    [hashes]
+  );
+  const byHash = new Map<string, ReturnType<typeof mapOperation>[]>();
+  for (const row of rows) {
+    const mapped = mapOperation(row);
+    const existing = byHash.get(row.transaction_hash);
+    if (existing) existing.push(mapped);
+    else byHash.set(row.transaction_hash, [mapped]);
+  }
+  return byHash;
+}
+
 export async function getLedgerBySequence(pool: Pool, sequence: number) {
   const { rows } = await pool.query<LedgerRow>('SELECT * FROM ledgers WHERE sequence = $1', [sequence]);
   return rows[0] ? mapLedger(rows[0]) : null;
+}
+
+export async function getLedgersBySequences(pool: Pool, sequences: readonly number[]) {
+  if (sequences.length === 0) return new Map<number, ReturnType<typeof mapLedger>>();
+  const { rows } = await pool.query<LedgerRow>('SELECT * FROM ledgers WHERE sequence = ANY($1::bigint[])', [sequences]);
+  return new Map(rows.map(row => [Number(row.sequence), mapLedger(row)]));
 }
 
 export async function getLatestLedgerFromDb(pool: Pool) {
@@ -263,6 +291,25 @@ export async function getAccountFromDb(pool: Pool, address: string) {
     flags: row.flags,
     thresholds: row.thresholds,
   });
+}
+
+export async function getAccountsFromDb(pool: Pool, addresses: readonly string[]) {
+  if (addresses.length === 0) return new Map<string, ReturnType<typeof mapAccount>>();
+  const { rows } = await pool.query<AccountRow>('SELECT * FROM accounts WHERE address = ANY($1::text[])', [addresses]);
+  return new Map(rows.map(row => [
+    row.address,
+    mapAccount({
+      address: row.address,
+      sequence: row.sequence,
+      subentry_count: row.subentry_count,
+      last_modified_ledger: Number(row.last_modified_ledger),
+      num_sponsored: row.num_sponsored,
+      num_sponsoring: row.num_sponsoring,
+      balances: row.balances,
+      flags: row.flags,
+      thresholds: row.thresholds,
+    }),
+  ]));
 }
 
 export async function getAccountTransactions(pool: Pool, address: string, limit: number) {

@@ -12,6 +12,7 @@ import {
   getTransactions,
   mapAccount,
 } from './db';
+import { createLoaders, type RequestLoaders } from './loaders';
 import { getAccount as getAccountFromHorizon, getLatestLedger as getLatestLedgerFromHorizon } from './horizon';
 import { createSubscriptionResolvers } from './subscriptions';
 import { getContractSchema, getCustomEvents, type CustomEventFilter } from './customEvents';
@@ -20,8 +21,13 @@ import type { LedgerNotifier } from './pubsub';
 
 export interface BaseContext {
   pool: Pool;
+  loaders?: RequestLoaders;
   /** Present for websocket connections; absent for plain HTTP queries. */
   notifier?: LedgerNotifier;
+}
+
+export function createContext(pool: Pool, extra: Omit<Context, 'pool' | 'loaders'> = {}): Context {
+  return { pool, loaders: createLoaders(pool), ...extra };
 }
 
 /**
@@ -30,7 +36,8 @@ export interface BaseContext {
  * indexed yet (indexer only writes accounts it's seen activity for), or a
  * fresh database with no ledgers indexed yet.
  */
-async function resolveAccount(address: string, pool: Pool) {
+async function resolveAccount(address: string, pool: Pool, loaders?: RequestLoaders) {
+  if (loaders) return loaders.account.load(address);
   const fromDb = await getAccountFromDb(pool, address);
   if (fromDb) return fromDb;
 
@@ -69,8 +76,8 @@ export const resolvers = {
       return getTransactionByHash(pool, args.hash);
     },
 
-    async account(_: unknown, args: { address: string }, { pool }: Context) {
-      return resolveAccount(args.address, pool);
+    async account(_: unknown, args: { address: string }, { pool, loaders }: Context) {
+      return resolveAccount(args.address, pool, loaders);
     },
 
     async operations(
@@ -204,23 +211,23 @@ export const resolvers = {
   },
 
   Transaction: {
-    async ledgerData(parent: { ledger: number }, _: unknown, { pool }: Context) {
-      return getLedgerBySequence(pool, parent.ledger);
+    async ledgerData(parent: { ledger: number }, _: unknown, { pool, loaders }: Context) {
+      return loaders ? loaders.ledger.load(parent.ledger) : getLedgerBySequence(pool, parent.ledger);
     },
-    async account(parent: { sourceAccount: string }, _: unknown, { pool }: Context) {
-      return resolveAccount(parent.sourceAccount, pool);
+    async account(parent: { sourceAccount: string }, _: unknown, { pool, loaders }: Context) {
+      return resolveAccount(parent.sourceAccount, pool, loaders);
     },
-    async operations(parent: { hash: string }, _: unknown, { pool }: Context) {
-      return getOperationsByTransactionHash(pool, parent.hash);
+    async operations(parent: { hash: string }, _: unknown, { pool, loaders }: Context) {
+      return loaders ? loaders.operationsByTransactionHash.load(parent.hash) : getOperationsByTransactionHash(pool, parent.hash);
     },
   },
 
   Operation: {
-    async transaction(parent: { transactionHash: string }, _: unknown, { pool }: Context) {
-      return getTransactionByHash(pool, parent.transactionHash);
+    async transaction(parent: { transactionHash: string }, _: unknown, { pool, loaders }: Context) {
+      return loaders ? loaders.transaction.load(parent.transactionHash) : getTransactionByHash(pool, parent.transactionHash);
     },
-    async account(parent: { sourceAccount: string }, _: unknown, { pool }: Context) {
-      return resolveAccount(parent.sourceAccount, pool);
+    async account(parent: { sourceAccount: string }, _: unknown, { pool, loaders }: Context) {
+      return resolveAccount(parent.sourceAccount, pool, loaders);
     },
   },
 };
